@@ -25,6 +25,8 @@
 #include <linux/earlysuspend.h>
 #endif
 #include <linux/miscdevice.h>
+#include <linux/notifier.h>
+#include <linux/fb.h>
 
 #include <asm/io.h>
 #include <asm/gpio.h>
@@ -85,17 +87,11 @@ extern int mcsdl_ISC_download_binary_data_G2(void);
 extern struct class *sec_class;
 extern int board_hw_revision;
 
-enum {
-	TKEY_LED_OFF,
-	TKEY_LED_ON,
-	TKEY_LED_SUSPEND,
-	TKEY_LED_RESUME,
-	TKEY_LED_FORCEDOFF
-};
-static unsigned int led_state = TKEY_LED_OFF;
-
 static int touchkey_status[MELFAS_MAX_KEYS]={0,};
 static int preKeyID = 0;
+
+static int fb_notifier_callback(struct notifier_block *self,
+	unsigned long event, void *data);
 
 static const int touchkey_keycodes[] = {
 			KEY_MENU,
@@ -145,6 +141,7 @@ struct mcs8000_ts_driver {
 	struct input_info info;
 	int suspended;
 	atomic_t keypad_enable;
+	struct notifier_block fb_notif;
 	struct early_suspend	early_suspend;
 };
 
@@ -253,6 +250,32 @@ void mcsdl_vdd_off(void)
 {
 	gpio_set_value( TSP_LDO_ON, 0 ); 
 	mdelay(10);
+}
+
+void tkey_led_on(void)
+{
+	int rc;
+
+	rc = vreg_enable(vreg_ldo2);
+
+	if (rc) {
+		pr_err("%s: LDO2 vreg enable failed (%d)\n",
+			  __func__, rc);
+		return rc;
+	}
+}
+
+void tkey_led_off(void)
+{
+	int rc;
+
+	rc = vreg_disable(vreg_ldo2);
+
+	if (rc) {
+		pr_err("%s: LDO2 vreg disable failed (%d)\n",
+			 __func__, rc);
+		return rc;
+	}
 }
 
 static int melfas_mcs8000_i2c_read(struct i2c_client* p_client, u8 reg, u8* data, int len)
@@ -570,42 +593,6 @@ static ssize_t tkey_noise_thd_show_mcs8000(struct device *dev, struct device_att
     return sprintf(buf, "0") ;
 }
 
-static ssize_t touch_led_control(struct device *dev, struct device_attribute *attr, const char *buf, size_t size)
-{
-	u8 data = 0x10;
-	int rc;
-	
-	if (sscanf(buf, "%d\n", &data) == 1)
-		printk("%d\n", data);
-
-#if DEBUG_PRINT
-    printk("touch_led_control : %d\n", data);
-#endif
-
-	if(data == 1 && led_state == TKEY_LED_OFF) {
-		rc = vreg_enable(vreg_ldo2);
-
-		if (rc) {
-			pr_err("%s: LDO2 vreg enable failed (%d)\n",
-			       __func__, rc);
-			return rc;
-		}
-
-		led_state = TKEY_LED_ON;
-	} else if(data == 2 && led_state == TKEY_LED_ON) {
-		rc = vreg_disable(vreg_ldo2);
-
-		if (rc) {
-			pr_err("%s: LDO2 vreg disable failed (%d)\n",
-			       __func__, rc);
-			return rc;
-		}
-        
-		led_state = TKEY_LED_OFF;
-	}
-
-	return size;
-}
 #ifdef QT_ATCOM_TEST
 
 static ssize_t key_threshold_show(struct device *dev, struct device_attribute *attr, char *buf)
@@ -628,7 +615,6 @@ static DEVICE_ATTR(debug, S_IRUGO | S_IWUSR, debug_show_mcs8000, debug_store_mcs
 static DEVICE_ATTR(tkey_sensitivity, S_IRUGO, tkey_sensitivity_show_mcs8000, NULL);
 static DEVICE_ATTR(tkey_sens_pline, S_IRUGO, tkey_sens_pline_show_mcs8000, NULL);
 static DEVICE_ATTR(tkey_noise_thd, S_IRUGO, tkey_noise_thd_show_mcs8000, NULL);
-static DEVICE_ATTR(brightness, 0666, NULL, touch_led_control);
 #ifdef QT_ATCOM_TEST
 static DEVICE_ATTR(key_threshold, S_IRUGO | S_IWUSR, key_threshold_show, key_threshold_store);
 #endif
@@ -2263,6 +2249,13 @@ int melfas_mcs8000_ts_probe(struct i2c_client *client,
 
 	printk("[Melfas] ret : %d, melfas_mcs8000_ts->client name : [%s]  [%d] [0x%x]\n",ret,melfas_mcs8000_ts->client->name, melfas_mcs8000_ts->client->irq, melfas_mcs8000_ts->client->addr);
 
+	melfas_mcs8000_ts->fb_notif.notifier_call = fb_notifier_callback;
+	ret = fb_register_client(&melfas_mcs8000_ts->fb_notif);
+	if (ret) {
+		pr_err("%s: Failed to register fb_notifier ret=%d\n",
+			__func__, ret);
+	}
+
 #ifdef CONFIG_HAS_EARLYSUSPEND
 	melfas_mcs8000_ts->early_suspend.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN + 1;
 	melfas_mcs8000_ts->early_suspend.suspend = melfas_mcs8000_ts_early_suspend;
@@ -2335,17 +2328,6 @@ int melfas_mcs8000_ts_suspend(pm_message_t mesg)
 	gpio_tlmm_config(GPIO_CFG(GPIO_I2C0_SDA, 0, GPIO_CFG_OUTPUT, GPIO_CFG_NO_PULL, GPIO_CFG_16MA),GPIO_CFG_ENABLE);
 
 	mcsdl_vdd_off();
-
-	if(led_state == TKEY_LED_ON) {
-		rc = vreg_disable(vreg_ldo2);
-        
-        printk("touch_led_control : ts_suspend forced off! rc = %d \n", rc);              
-
-		if (rc) 
-			pr_err("%s: LDO2 vreg disable failed (%d)\n", __func__, rc);		
-        else 
-            led_state = TKEY_LED_FORCEDOFF;
-	}
         
 	gpio_set_value(GPIO_I2C0_SCL, 0);  // TOUCH SCL DIS
 	gpio_set_value(GPIO_I2C0_SDA, 0);  // TOUCH SDA DIS
@@ -2373,18 +2355,7 @@ int melfas_mcs8000_ts_resume()
     msleep(200);
 
     melfas_mcs8000_ts->suspended = false;
-    enable_irq(melfas_mcs8000_ts->client->irq);  
-
-    if(led_state == TKEY_LED_FORCEDOFF) { 
-        rc = vreg_enable(vreg_ldo2); 
-
-        printk("%s TKEY_LED_FORCEDOFF  rc = %d \n", __func__,rc);               
-
-        if (rc)  
-            pr_err("%s: LDO2 vreg disable failed (%d)\n", __func__, rc);		 
-        else  
-            led_state = TKEY_LED_ON; 
-    }
+    enable_irq(melfas_mcs8000_ts->client->irq);
 
     return 0;
 }
@@ -2414,6 +2385,27 @@ int set_tsp_for_ta_detect(int state)
     return 1;
 }
 EXPORT_SYMBOL(set_tsp_for_ta_detect);
+
+static int fb_notifier_callback(struct notifier_block *self,
+	unsigned long event, void *data)
+{
+	struct fb_event *evdata = data;
+	int *blank;
+	struct mcs8000_ts_driver *ts =
+		container_of(self, struct mcs8000_ts_driver, fb_notif);
+
+	if (evdata && evdata->data && melfas_mcs8000_ts && melfas_mcs8000_ts->client) {
+		if (event == FB_EVENT_BLANK) {
+			blank = evdata->data;
+			if (*blank == FB_BLANK_UNBLANK)
+				tkey_led_on();
+			else if (*blank == FB_BLANK_POWERDOWN)
+				tkey_led_off();
+		}
+	}
+
+	return 0;
+}
 
 static int __devexit melfas_mcs8000_i2c_remove(struct i2c_client *client)
 {
@@ -2504,8 +2496,6 @@ int __init melfas_mcs8000_ts_init(void)
 		pr_err("Failed to create device file(%s)!\n", dev_attr_tkey_sens_pline.attr.name);
     	if (device_create_file(mcs8000_ts_dev, &dev_attr_tkey_noise_thd) < 0)
 		pr_err("Failed to create device file(%s)!\n", dev_attr_tkey_noise_thd.attr.name);
-	if (device_create_file(mcs8000_ts_dev, &dev_attr_brightness) < 0)
-		pr_err("Failed to create device file(%s)!\n", dev_attr_brightness.attr.name);
 #ifdef QT_ATCOM_TEST
 
     if (device_create_file(mcs8000_ts_dev, &dev_attr_key_threshold) < 0)
