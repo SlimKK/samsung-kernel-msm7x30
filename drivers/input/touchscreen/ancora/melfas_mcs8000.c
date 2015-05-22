@@ -27,6 +27,7 @@
 #include <linux/miscdevice.h>
 #include <linux/notifier.h>
 #include <linux/fb.h>
+#include <linux/bln2.h>
 
 #include <asm/io.h>
 #include <asm/gpio.h>
@@ -348,6 +349,44 @@ static int melfas_mcs8000_read_version(void)
 
     return ret;
 }
+
+#ifdef CONFIG_GENERIC_BLN2
+static int melfas_enable_touchkey_bln(int led_mask)
+{
+	tkey_led_on();
+
+	return 0;
+}
+
+static int melfas_disable_touchkey_bln(int led_mask)
+{
+	tkey_led_off();
+
+	return 0;
+}
+
+static int melfas_power_on(void)
+{
+	/* Do nothing */
+
+	return 0;
+}
+
+static int melfas_power_off(void)
+{
+	/* Do nothing */
+
+	return 0;
+}
+
+static struct bln_implementation melfas_touchkey_bln = {
+	.enable = melfas_enable_touchkey_bln,
+	.disable = melfas_disable_touchkey_bln,
+	.power_on = melfas_power_on,
+	.power_off = melfas_power_off,
+	.led_count = 1
+};
+#endif
 
 static void melfas_mcs8000_read_resolution(void)
 {
@@ -2228,6 +2267,10 @@ int melfas_mcs8000_ts_probe(struct i2c_client *client,
 	input_set_abs_params(melfas_mcs8000_ts->input_dev, ABS_MT_PRESSURE, 0, 255, 0, 0);
 
 	atomic_set(&melfas_mcs8000_ts->keypad_enable, 1);
+
+#ifdef CONFIG_GENERIC_BLN2
+	register_bln_implementation(&melfas_touchkey_bln);
+#endif
 
 	printk("melfas_mcs8000_ts_probe: max_x: %d, max_y: %d\n", max_x, max_y);
 
